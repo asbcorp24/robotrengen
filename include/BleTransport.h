@@ -44,16 +44,20 @@ class BleTransport : private BLEServerCallbacks,
   bool onSecurityRequest() override { return connected_.load(); }
   void onAuthenticationComplete(ble_gap_conn_desc*, int) override;
 
-  enum class EventKind : uint8_t { Connect, Disconnect, Security, Subscribe };
+  enum class EventKind : uint8_t { Connect, Disconnect, Security, Subscribe, Phy };
   struct Event {
     EventKind kind;
     uint16_t handle;
     int status = 0;
     uint8_t keySize = 0;
     bool encrypted = false;
+    uint8_t txPhy = 0;
+    uint8_t rxPhy = 0;
   };
   void recordEvent(const Event& event);
   void printEvents();
+  void requestPhy();
+  static int onGapEvent(ble_gap_event* event, void* context);
 
   QueueHandle_t ingress_ = nullptr;
   QueueHandle_t events_ = nullptr;
@@ -65,6 +69,8 @@ class BleTransport : private BLEServerCallbacks,
   std::atomic<bool> encrypted_{false};
   std::atomic<bool> subscribed_{false};
   std::atomic<bool> restartAdvertising_{false};
+  std::atomic<bool> phyPending_{false};
+  ble_gap_event_listener phyListener_{};
   std::atomic<uint16_t> mtu_{23};
   std::atomic<uint16_t> connectionId_{0xffff};
   std::atomic<uint32_t> generation_{0};

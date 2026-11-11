@@ -1,6 +1,7 @@
 #include "BleTransport.h"
 
 #include "Config.h"
+#include <host/ble_gap.h>
 #include <host/ble_gatt.h>
 #include <host/ble_hs_mbuf.h>
 #include <stdio.h>
@@ -10,6 +11,17 @@
 #error This transport uses the bundled Arduino NimBLE BLE library (pioarduino 55.03.312).
 #endif
 
+namespace {
+const char* phyName(uint8_t phy) {
+  switch (phy) {
+    case BLE_GAP_LE_PHY_1M: return "1M";
+    case BLE_GAP_LE_PHY_2M: return "2M";
+    case BLE_GAP_LE_PHY_CODED: return "Coded";
+    default: return "unknown";
+  }
+}
+}  // namespace
+
 void BleTransport::begin(uint32_t bootId) {
   bootId_ = bootId;
   ingress_ = xQueueCreate(16, sizeof(BleFragment));
@@ -18,6 +30,8 @@ void BleTransport::begin(uint32_t bootId) {
   char name[24];
   snprintf(name, sizeof(name), "Crawler-%06llX", ESP.getEfuseMac() & 0xffffffULL);
   if (!BLEDevice::init(name)) abort();
+  const int listenerStatus = ble_gap_event_listener_register(&phyListener_, onGapEvent, this);
+  if (listenerStatus != 0) Serial.printf("BLE PHY listener status=%d\n", listenerStatus);
   BLEDevice::setMTU(config::kBleMtu);
   BLEDevice::setSecurityCallbacks(this);
   // Bring-up pairing: encrypted LE Secure Connections, Just Works + bonding.
@@ -62,6 +76,7 @@ void BleTransport::onConnect(BLEServer* server, ble_gap_conn_desc* p) {
   connectionId_.store(p->conn_handle);
   encrypted_.store(false);
   subscribed_.store(false);
+  phyPending_.store(false);
   mtu_.store(23);
   generation_.fetch_add(1);
   restartAdvertising_.store(false);
@@ -76,6 +91,7 @@ void BleTransport::onDisconnect(BLEServer*, ble_gap_conn_desc* p) {
   connected_.store(false);
   encrypted_.store(false);
   subscribed_.store(false);
+  phyPending_.store(false);
   connectionId_.store(0xffff);
   generation_.fetch_add(1);
   restartAdvertising_.store(true);
@@ -89,11 +105,13 @@ void BleTransport::onAuthenticationComplete(ble_gap_conn_desc* p, int status) {
   recordEvent({EventKind::Security, p->conn_handle, status,
                static_cast<uint8_t>(p->sec_state.key_size), p->sec_state.encrypted != 0});
   const bool secure = status == 0 && p->sec_state.encrypted && p->sec_state.key_size == 16;
-  if (encrypted_.load() != secure) {
+  const bool wasEncrypted = encrypted_.load();
+  if (wasEncrypted != secure) {
     encrypted_.store(false);
     generation_.fetch_add(1);
   }
   encrypted_.store(secure);
+  if (secure && !wasEncrypted) phyPending_.store(true);
   if (!secure) server_->disconnect(connectionId_.load());
 }
 void BleTransport::onSubscribe(BLECharacteristic* characteristic, ble_gap_conn_desc* p, uint16_t value) {
@@ -146,6 +164,35 @@ bool BleTransport::receive(BleFragment& fragment) {
 void BleTransport::recordEvent(const Event& event) {
   xQueueSend(events_, &event, 0);
 }
+int BleTransport::onGapEvent(ble_gap_event* event, void* context) {
+  if (event->type != BLE_GAP_EVENT_PHY_UPDATE_COMPLETE) return 0;
+  auto& self = *static_cast<BleTransport*>(context);
+  const auto& phy = event->phy_updated;
+  if (phy.conn_handle == self.connectionId_.load()) {
+    Event report{EventKind::Phy, phy.conn_handle, phy.status};
+    if (phy.status == 0) {
+      report.txPhy = phy.tx_phy;
+      report.rxPhy = phy.rx_phy;
+    }
+    self.recordEvent(report);
+  }
+  return 0;
+}
+
+void BleTransport::requestPhy() {
+  const uint16_t handle = connectionId_.load();
+  if (handle == 0xffff || !encrypted_.load()) return;
+  uint8_t tx = 0, rx = 0;
+  const int readStatus = ble_gap_read_le_phy(handle, &tx, &rx);
+  Serial.printf("BLE PHY initial status=%d TX=%s RX=%s\n",
+                readStatus, phyName(tx), phyName(rx));
+  if (config::kPreferCodedPhyS8) {
+    const int status = ble_gap_set_prefered_le_phy(
+        handle, BLE_GAP_LE_PHY_CODED_MASK, BLE_GAP_LE_PHY_CODED_MASK, BLE_GAP_LE_PHY_CODED_S8);
+    Serial.printf("BLE PHY request=Coded S=8 status=%d\n", status);
+  }
+}
+
 void BleTransport::printEvents() {
   Event event;
   for (unsigned i = 0; i < 8 && xQueueReceive(events_, &event, 0) == pdTRUE; ++i) {
@@ -164,11 +211,16 @@ void BleTransport::printEvents() {
       case EventKind::Subscribe:
         Serial.printf("BLE TX notify handle=%u enabled=%d\n", handle, event.status);
         break;
+      case EventKind::Phy:
+        Serial.printf("BLE PHY update handle=%u status=%d TX=%s RX=%s\n",
+                      handle, event.status, phyName(event.txPhy), phyName(event.rxPhy));
+        break;
     }
   }
 }
 void BleTransport::poll(uint32_t now) {
   printEvents();
+  if (phyPending_.exchange(false)) requestPhy();
   if (restartAdvertising_.exchange(false)) restartAtMs_ = now + 150;
   if (restartAtMs_ && static_cast<int32_t>(now - restartAtMs_) >= 0) {
     restartAtMs_ = 0;

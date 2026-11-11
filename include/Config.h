@@ -14,6 +14,7 @@ constexpr uint32_t kBleAssemblyTimeoutMs = 1000;
 constexpr uint32_t kBleSendTimeoutMs = 1000;
 constexpr uint32_t kNotifyIntervalMs = 10;
 constexpr uint16_t kBleMtu = 247;
+constexpr bool kPreferCodedPhyS8 = true;
 constexpr uint32_t kStatsIntervalMs = 5000;
 
 constexpr char kServiceUuid[] = "82b10001-95c4-4f26-a9db-96ef80e73210";
