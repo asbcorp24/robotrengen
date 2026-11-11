@@ -44,7 +44,19 @@ class BleTransport : private BLEServerCallbacks,
   bool onSecurityRequest() override { return connected_.load(); }
   void onAuthenticationComplete(ble_gap_conn_desc*, int) override;
 
+  enum class EventKind : uint8_t { Connect, Disconnect, Security, Subscribe };
+  struct Event {
+    EventKind kind;
+    uint16_t handle;
+    int status = 0;
+    uint8_t keySize = 0;
+    bool encrypted = false;
+  };
+  void recordEvent(const Event& event);
+  void printEvents();
+
   QueueHandle_t ingress_ = nullptr;
+  QueueHandle_t events_ = nullptr;
   BLEServer* server_ = nullptr;
   BLECharacteristic* rx_ = nullptr;
   BLECharacteristic* tx_ = nullptr;

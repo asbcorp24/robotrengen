@@ -26,21 +26,21 @@ uint32_t crc32(const uint8_t* data, size_t size) {
   }
   return crc ^ 0xffffffffu;
 }
-size_t encodeRaw(const Packet& packet, uint8_t* out, size_t capacity) {
+size_t encodeRaw(const Packet& packet, uint8_t* out, size_t capacity, uint8_t version) {
   const size_t size = kHeaderSize + packet.size + kCrcSize;
   if (packet.size > kMaxPayload || capacity < size) return 0;
-  out[0] = kVersion;
+  out[0] = version;
   out[1] = static_cast<uint8_t>(packet.type);
-  write16(out + 2, 0);  // Reserved flags; v1 requires zero.
+  write16(out + 2, 0);  // Reserved flags; send zero.
   write16(out + 4, packet.size);
   write32(out + 6, packet.sequence);
   memcpy(out + kHeaderSize, packet.payload, packet.size);
   write32(out + size - kCrcSize, crc32(out, size - kCrcSize));
   return size;
 }
-bool decodeRaw(const uint8_t* data, size_t size, Packet& packet) {
+bool decodeRaw(const uint8_t* data, size_t size, Packet& packet, uint8_t version) {
   if (size < kHeaderSize + kCrcSize || size > kMaxRaw) return false;
-  if (data[0] != kVersion || read16(data + 2) != 0) return false;
+  if (data[0] != version || read16(data + 2) != 0) return false;
   const uint16_t payloadSize = read16(data + 4);
   if (payloadSize > kMaxPayload || size != kHeaderSize + payloadSize + kCrcSize)
     return false;
@@ -122,7 +122,7 @@ FeedResult UartDecoder::feed(uint8_t byte, uint32_t now, Packet& packet) {
     if (!used_) return FeedResult::None;
     const size_t size = cobsDecode(encoded_, used_, raw_, sizeof(raw_));
     used_ = 0;
-    return size && decodeRaw(raw_, size, packet) ? FeedResult::Complete : FeedResult::Rejected;
+    return size && decodeRaw(raw_, size, packet, kUartVersion) ? FeedResult::Complete : FeedResult::Rejected;
   }
   if (discarding_) return FeedResult::None;
   if (used_ == sizeof(encoded_)) {

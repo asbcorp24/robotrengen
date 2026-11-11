@@ -1,6 +1,6 @@
 """UART peer for bridge bring-up. No actuators; every control request is rejected.
 
-Requires pyserial only in --port mode. --example works with the standard library.
+Requires pyserial and cbor2 only in --port mode. --example works with the standard library.
 """
 import argparse
 import json
@@ -9,49 +9,30 @@ import struct
 import time
 import zlib
 
+VERSION = 2  # BLE
+UART_VERSION = 3
 MAX_RAW = 1038
 HELLO, SCHEMA_REQUEST, SCHEMA, SNAPSHOT_REQUEST = 1, 2, 3, 4
 TELEMETRY, ERRORS, COMMAND, STOP, COMMAND_RESULT, LINK_STATE = 0x10, 0x11, 0x20, 0x21, 0x22, 0x40
 
 
-def cbor_head(major, value):
-    if value < 24:
-        return bytes([(major << 5) | value])
-    for additional, fmt, maximum in [(24, ">B", 0xff), (25, ">H", 0xffff),
-                                     (26, ">I", 0xffffffff), (27, ">Q", 0xffffffffffffffff)]:
-        if value <= maximum:
-            return bytes([(major << 5) | additional]) + struct.pack(fmt, value)
-    raise ValueError("CBOR integer too large")
+def json_payload(value):
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
 
 
-def cbor(value):
-    if isinstance(value, bool):
-        return b"\xf5" if value else b"\xf4"
-    if isinstance(value, int):
-        return cbor_head(0 if value >= 0 else 1, value if value >= 0 else -1 - value)
-    if isinstance(value, str):
-        encoded = value.encode("utf-8")
-        return cbor_head(3, len(encoded)) + encoded
-    if isinstance(value, list):
-        return cbor_head(4, len(value)) + b"".join(map(cbor, value))
-    if isinstance(value, dict):
-        return cbor_head(5, len(value)) + b"".join(cbor(k) + cbor(v) for k, v in value.items())
-    raise TypeError(type(value).__name__)
-
-
-def raw_packet(kind, sequence, payload):
+def raw_packet(kind, sequence, payload, version=VERSION):
     if len(payload) > 1024:
         raise ValueError("Payload exceeds 1024 bytes")
-    head = struct.pack("<BBHHI", 1, kind, 0, len(payload), sequence)
+    head = struct.pack("<BBHHI", version, kind, 0, len(payload), sequence)
     data = head + payload
     return data + struct.pack("<I", zlib.crc32(data))
 
 
-def parse_packet(raw):
+def parse_packet(raw, expected_version=VERSION):
     if not 14 <= len(raw) <= MAX_RAW:
         raise ValueError("Invalid raw length")
     version, kind, flags, length, sequence = struct.unpack_from("<BBHHI", raw)
-    if version != 1 or flags or len(raw) != 14 + length:
+    if version != expected_version or flags or len(raw) != 14 + length:
         raise ValueError("Invalid header")
     if zlib.crc32(raw[:-4]) != struct.unpack_from("<I", raw, len(raw) - 4)[0]:
         raise ValueError("CRC mismatch")
@@ -109,26 +90,28 @@ def main():
     parser.add_argument("--example", action="store_true", help="Print frames without hardware")
     args = parser.parse_args()
     if args.example:
-        for label, kind, payload in [
+        for sequence, (label, kind, payload) in enumerate([
             ("phone_snapshot_request", SNAPSHOT_REQUEST, {}),
-            ("stm32_telemetry", TELEMETRY, {0: 42, 1: 1000, 2: {1001: 24700, 1002: 35}}),
-        ]:
-            raw = raw_packet(kind, 1, cbor(payload))
-            print(json.dumps({"name": label, "raw_hex": raw.hex(),
-                              "uart_hex": (cobs_encode(raw) + b"\0").hex(),
-                              "ble_mtu23_hex": [f.hex() for f in fragments(raw)]}, indent=2))
+            ("phone_simulated_start", COMMAND, {"op": "start"}),
+            ("phone_simulated_stop", STOP, {}),
+            ("stm32_telemetry", TELEMETRY, {"boot_id": 42, "sample_ms": 1000, "values": {"drive_battery_voltage": 24700, "drive_battery_temperature": 35}}),
+        ], start=1):
+            raw = raw_packet(kind, sequence, json_payload(payload))
+            print(json.dumps({"name": label, "payload": payload, "raw_hex": raw.hex(),
+                              "ble_mtu23_hex": [f.hex() for f in fragments(raw, message_id=sequence)]}, indent=2))
         return
     if not args.port:
         parser.error("Specify --port COMx or --example")
     try:
         import serial
+        import cbor2
     except ImportError:
-        raise SystemExit("Install pyserial: python -m pip install pyserial")
+        raise SystemExit("Install UART simulator dependencies: python -m pip install pyserial cbor2")
 
     boot_id = random.getrandbits(32)
     sequence = 0
     started = time.monotonic()
-    schema = {0: 1, 1: 0, 2: 1, 3: [
+    schema = {"revision": 1, "part_index": 0, "parts_total": 1, "fields": [
         {"id": 1001, "key": "drive_battery_voltage", "name": "Battery voltage",
          "type": "uint32", "unit": "mV", "access": "read", "period_ms": 1000},
         {"id": 1002, "key": "drive_battery_temperature", "name": "Battery temperature",
@@ -139,12 +122,13 @@ def main():
             nonlocal sequence
             sequence = (sequence + 1) & 0xffffffff
             seq = sequence if request_sequence is None else request_sequence
-            port.write(cobs_encode(raw_packet(kind, seq, cbor(value))) + b"\0")
+            port.write(cobs_encode(raw_packet(kind, seq, cbor2.dumps(value), UART_VERSION)) + b"\0")
 
         def snapshot():
             elapsed = int((time.monotonic() - started) * 1000) & 0xffffffff
-            send(TELEMETRY, {0: boot_id, 1: elapsed, 2: {1001: 24700, 1002: 35}})
-            send(ERRORS, {0: boot_id, 1: 0, 2: []})
+            send(TELEMETRY, {"boot_id": boot_id, "sample_ms": elapsed,
+                             "values": {"drive_battery_voltage": 24700, "drive_battery_temperature": 35}})
+            send(ERRORS, {"boot_id": boot_id, "revision": 0, "active": []})
 
         print(f"STM32 simulator on {args.port}; commands are rejected; Ctrl+C to exit.")
         port.write(b"\0")
@@ -164,10 +148,13 @@ def main():
                     discard = False
                     continue
                 try:
-                    kind, request_seq, payload = parse_packet(cobs_decode(buffer))
-                    print(f"RX type=0x{kind:02x} seq={request_seq} payload={payload.hex()}")
+                    kind, request_seq, payload = parse_packet(cobs_decode(buffer), UART_VERSION)
+                    value = cbor2.loads(payload)
+                    if not isinstance(value, dict):
+                        raise ValueError("CBOR payload must be a map")
+                    print(f"RX type=0x{kind:02x} seq={request_seq} payload={value}")
                     if kind == HELLO:
-                        send(HELLO, {0: "stm32-simulator", 1: boot_id, 2: 1})
+                        send(HELLO, {"device_id": "stm32-simulator", "boot_id": boot_id, "schema_revision": 1})
                     elif kind == SCHEMA_REQUEST:
                         send(SCHEMA, schema)
                     elif kind == SNAPSHOT_REQUEST:
@@ -176,7 +163,7 @@ def main():
                         send(COMMAND_RESULT, {"status": "rejected", "reason": "simulator_no_actuators"}, request_seq)
                     elif kind == LINK_STATE:
                         pass  # Link state never substitutes for a manual-control lease.
-                except ValueError as error:
+                except (ValueError, cbor2.CBORDecodeError) as error:
                     print(f"Rejected UART frame: {error}")
                 buffer.clear()
             if time.monotonic() >= next_tick:

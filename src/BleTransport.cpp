@@ -13,7 +13,8 @@
 void BleTransport::begin(uint32_t bootId) {
   bootId_ = bootId;
   ingress_ = xQueueCreate(16, sizeof(BleFragment));
-  if (!ingress_) abort();
+  events_ = xQueueCreate(8, sizeof(Event));
+  if (!ingress_ || !events_) abort();
   char name[24];
   snprintf(name, sizeof(name), "Crawler-%06llX", ESP.getEfuseMac() & 0xffffffULL);
   if (!BLEDevice::init(name)) abort();
@@ -65,11 +66,13 @@ void BleTransport::onConnect(BLEServer* server, ble_gap_conn_desc* p) {
   generation_.fetch_add(1);
   restartAdvertising_.store(false);
   connected_.store(true);
+  recordEvent({EventKind::Connect, p->conn_handle, 0, 0, false});
   BLEDevice::getAdvertising()->stop();
   // The bundled server starts security after this callback (forceAuthentication).
 }
 void BleTransport::onDisconnect(BLEServer*, ble_gap_conn_desc* p) {
   if (p->conn_handle != connectionId_.load()) return;
+  recordEvent({EventKind::Disconnect, p->conn_handle, 0, 0, false});
   connected_.store(false);
   encrypted_.store(false);
   subscribed_.store(false);
@@ -83,6 +86,8 @@ void BleTransport::onMtuChanged(BLEServer*, ble_gap_conn_desc* p, uint16_t mtu) 
 }
 void BleTransport::onAuthenticationComplete(ble_gap_conn_desc* p, int status) {
   if (!p || !connected_.load() || p->conn_handle != connectionId_.load()) return;
+  recordEvent({EventKind::Security, p->conn_handle, status,
+               static_cast<uint8_t>(p->sec_state.key_size), p->sec_state.encrypted != 0});
   const bool secure = status == 0 && p->sec_state.encrypted && p->sec_state.key_size == 16;
   if (encrypted_.load() != secure) {
     encrypted_.store(false);
@@ -94,6 +99,7 @@ void BleTransport::onAuthenticationComplete(ble_gap_conn_desc* p, int status) {
 void BleTransport::onSubscribe(BLECharacteristic* characteristic, ble_gap_conn_desc* p, uint16_t value) {
   if (characteristic != tx_ || p->conn_handle != connectionId_.load()) return;
   const bool notifications = (value & 1) != 0;
+  recordEvent({EventKind::Subscribe, p->conn_handle, notifications, 0, false});
   if (subscribed_.load() != notifications) {
     subscribed_.store(false);
     generation_.fetch_add(1);
@@ -118,9 +124,10 @@ void BleTransport::onRead(BLECharacteristic* characteristic) {
   if (characteristic != info_) return;
   char info[200];
   snprintf(info, sizeof(info),
-           "{\"protocol\":1,\"boot_id\":%lu,\"generation\":%lu,\"max_payload\":1024,"
+           "{\"protocol\":%u,\"boot_id\":%lu,\"generation\":%lu,\"max_payload\":1024,"
            "\"rx_drops\":%lu,\"pairing\":\"development_just_works\"}",
-           static_cast<unsigned long>(bootId_), static_cast<unsigned long>(generation()),
+           static_cast<unsigned>(wire::kVersion), static_cast<unsigned long>(bootId_),
+           static_cast<unsigned long>(generation()),
            static_cast<unsigned long>(rxDrops()));
   info_->setValue(reinterpret_cast<const uint8_t*>(info), strlen(info));
 }
@@ -136,7 +143,32 @@ bool BleTransport::notify(const uint8_t* data, size_t size, uint32_t generation)
 bool BleTransport::receive(BleFragment& fragment) {
   return xQueueReceive(ingress_, &fragment, 0) == pdTRUE;
 }
+void BleTransport::recordEvent(const Event& event) {
+  xQueueSend(events_, &event, 0);
+}
+void BleTransport::printEvents() {
+  Event event;
+  for (unsigned i = 0; i < 8 && xQueueReceive(events_, &event, 0) == pdTRUE; ++i) {
+    const unsigned handle = event.handle;
+    switch (event.kind) {
+      case EventKind::Connect:
+        Serial.printf("BLE connected handle=%u\n", handle);
+        break;
+      case EventKind::Disconnect:
+        Serial.printf("BLE disconnected handle=%u\n", handle);
+        break;
+      case EventKind::Security:
+        Serial.printf("BLE security handle=%u status=%d encrypted=%d key_size=%u\n",
+                      handle, event.status, event.encrypted, static_cast<unsigned>(event.keySize));
+        break;
+      case EventKind::Subscribe:
+        Serial.printf("BLE TX notify handle=%u enabled=%d\n", handle, event.status);
+        break;
+    }
+  }
+}
 void BleTransport::poll(uint32_t now) {
+  printEvents();
   if (restartAdvertising_.exchange(false)) restartAtMs_ = now + 150;
   if (restartAtMs_ && static_cast<int32_t>(now - restartAtMs_) >= 0) {
     restartAtMs_ = 0;

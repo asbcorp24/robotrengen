@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <BridgePayload.h>
 #include <BridgeProtocol.h>
 #include <esp_system.h>
 
@@ -88,7 +89,10 @@ void readPhone(uint32_t now) {
     if (result == wire::FeedResult::Rejected) {
       ++stats.bleBad;
     } else if (result == wire::FeedResult::Complete) {
-      if (!wire::allowedFromPhone(pending.packet.type)) {
+      JsonDocument json;
+      if (!wire::allowedFromPhone(pending.packet.type) ||
+          !payload::readJson(pending.packet, json) ||
+          !payload::writeCbor(json.as<JsonVariantConst>(), pending.packet)) {
         ++stats.bleBad;
         continue;
       }
@@ -121,6 +125,11 @@ void readController(uint32_t now) {
       }
       ++stats.uartRx;
       if (!ble.ready()) continue;  // Reconnect must request a fresh snapshot.
+      JsonDocument json;
+      if (!payload::readCbor(packet, json) || !payload::writeJson(json.as<JsonVariantConst>(), packet)) {
+        ++stats.uartBad;
+        continue;
+      }
       Pending pending;
       pending.packet = packet;
       pending.generation = ble.generation();
@@ -144,19 +153,11 @@ wire::Packet makeLinkState() {
   wire::Packet packet;
   packet.type = wire::Type::LinkState;
   packet.sequence = ++linkSequence;
-  // CBOR {0: boot_id, 1: generation, 2: ready}; uint32 CBOR is big-endian.
-  uint8_t* p = packet.payload;
-  *p++ = 0xa3;
-  *p++ = 0x00;
-  *p++ = 0x1a;
-  for (int i = 3; i >= 0; --i) *p++ = (bootId >> (8 * i)) & 0xff;
-  *p++ = 0x01;
-  *p++ = 0x1a;
-  const uint32_t generation = ble.generation();
-  for (int i = 3; i >= 0; --i) *p++ = (generation >> (8 * i)) & 0xff;
-  *p++ = 0x02;
-  *p++ = ble.ready() ? 0xf5 : 0xf4;
-  packet.size = p - packet.payload;
+  JsonDocument state;
+  state["boot_id"] = bootId;
+  state["generation"] = ble.generation();
+  state["ready"] = ble.ready();
+  if (!state.overflowed()) payload::writeCbor(state.as<JsonVariantConst>(), packet);
   return packet;
 }
 
@@ -176,6 +177,7 @@ void writeController(uint32_t now) {
     bool fromPhone = found;
     if (!found && linkDirty) {
       pending.packet = makeLinkState();
+      if (!pending.packet.size) return;
       linkDirty = false;
       found = true;
     } else if (!found) {
@@ -189,7 +191,7 @@ void writeController(uint32_t now) {
       return;
     }
     uint8_t raw[wire::kMaxRaw];
-    const size_t rawSize = wire::encodeRaw(pending.packet, raw, sizeof(raw));
+    const size_t rawSize = wire::encodeRaw(pending.packet, raw, sizeof(raw), wire::kUartVersion);
     uartTx.size = wire::cobsEncode(raw, rawSize, uartTx.bytes, sizeof(uartTx.bytes) - 1);
     if (!rawSize || !uartTx.size) {
       uartTx.size = 0;
@@ -270,9 +272,10 @@ void setup() {
   controller.write(static_cast<uint8_t>(0));
   bootId = esp_random();
   ble.begin(bootId);
-  Serial.printf("UART1: RX=%d TX=%d baud=%lu; protocol=1; boot=%lu\n",
+  Serial.printf("UART1: RX=%d TX=%d baud=%lu; UART protocol=%u; boot=%lu\n",
                 config::kUartRxPin, config::kUartTxPin,
-                static_cast<unsigned long>(config::kUartBaud), static_cast<unsigned long>(bootId));
+                static_cast<unsigned long>(config::kUartBaud), static_cast<unsigned>(wire::kUartVersion),
+                static_cast<unsigned long>(bootId));
 }
 
 void loop() {

@@ -24,15 +24,15 @@ void same(const wire::Packet& a, const wire::Packet& b) {
   assert(a.type == b.type && a.sequence == b.sequence && a.size == b.size);
   assert(memcmp(a.payload, b.payload, a.size) == 0);
 }
-std::vector<uint8_t> raw(const wire::Packet& p) {
+std::vector<uint8_t> raw(const wire::Packet& p, uint8_t version = wire::kVersion) {
   std::vector<uint8_t> bytes(wire::kMaxRaw);
-  const size_t size = wire::encodeRaw(p, bytes.data(), bytes.size());
+  const size_t size = wire::encodeRaw(p, bytes.data(), bytes.size(), version);
   assert(size);
   bytes.resize(size);
   return bytes;
 }
 std::vector<uint8_t> frame(const wire::Packet& p) {
-  const auto bytes = raw(p);
+  const auto bytes = raw(p, wire::kUartVersion);
   std::vector<uint8_t> encoded(wire::kMaxEncoded + 1);
   const size_t size = wire::cobsEncode(bytes.data(), bytes.size(), encoded.data(), encoded.size() - 1);
   assert(size);
@@ -53,13 +53,14 @@ void testCrcAndWire() {
   const uint8_t text[] = "123456789";
   assert(wire::crc32(text, 9) == 0xcbf43926);
   // Independent Python struct/zlib fixture, also printed by stm32_simulator.py.
-  const uint8_t golden[] = {0x01, 0x04, 0, 0, 0x01, 0, 0x01, 0, 0, 0,
-                            0xa0, 0xba, 0x4f, 0x23, 0xee};
+  const uint8_t golden[] = {0x02, 0x04, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00,
+                            0x7b, 0x7d, 0x16, 0x52, 0x31, 0x4c};
   wire::Packet request;
   request.type = wire::Type::SnapshotRequest;
   request.sequence = 1;
-  request.size = 1;
-  request.payload[0] = 0xa0;
+  request.size = 2;
+  request.payload[0] = '{';
+  request.payload[1] = '}';
   const auto requestRaw = raw(request);
   assert(requestRaw.size() == sizeof(golden));
   assert(memcmp(requestRaw.data(), golden, sizeof(golden)) == 0);

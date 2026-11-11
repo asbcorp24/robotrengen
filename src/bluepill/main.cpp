@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <BridgePayload.h>
 #include <BridgeProtocol.h>
 #include <Serial.h>
 #include <string.h>
@@ -20,45 +21,11 @@ uint32_t sequence = 0, errorRevision = 0, distanceMm = 0;
 uint32_t lastTick = 0, lastTelemetry = 0, lastErrors = 0;
 bool moving = false, fault = false;
 
-// Only the CBOR types emitted by this simulator are needed here.
-class Cbor {
- public:
-  explicit Cbor(wire::Packet& packet) : packet_(packet) { packet_.size = 0; }
-  void number(uint32_t value) { item(0, value); }
-  void map(uint8_t count) { item(5, count); }
-  void array(uint8_t count) { item(4, count); }
-  void boolean(bool value) { byte(value ? 0xf5 : 0xf4); }
-  void string(const char* value) {
-    item(3, strlen(value));
-    while (*value) byte(static_cast<uint8_t>(*value++));
-  }
-  bool valid() const { return valid_; }
-
- private:
-  void byte(uint8_t value) {
-    if (packet_.size < wire::kMaxPayload) packet_.payload[packet_.size++] = value;
-    else valid_ = false;
-  }
-  void item(uint8_t major, uint32_t value) {
-    const uint8_t prefix = major << 5;
-    if (value < 24) {
-      byte(prefix | value);
-      return;
-    }
-    const int bytes = value <= 0xff ? 1 : (value <= 0xffff ? 2 : 4);
-    byte(prefix | (bytes == 1 ? 24 : (bytes == 2 ? 25 : 26)));
-    for (int shift = (bytes - 1) * 8; shift >= 0; shift -= 8) byte(value >> shift);
-  }
-
-  wire::Packet& packet_;
-  bool valid_ = true;
-};
-
-void send(const Cbor& payload, wire::Type type, uint32_t seq) {
-  if (!payload.valid()) return;
+void send(const JsonDocument& doc, wire::Type type, uint32_t seq) {
+  if (doc.overflowed() || !payload::writeCbor(doc.as<JsonVariantConst>(), outgoing)) return;
   outgoing.type = type;
   outgoing.sequence = seq;
-  const size_t rawSize = wire::encodeRaw(outgoing, raw, sizeof(raw));
+  const size_t rawSize = wire::encodeRaw(outgoing, raw, sizeof(raw), wire::kUartVersion);
   if (!rawSize) return;
   const size_t encodedSize = wire::cobsEncode(raw, rawSize, frame, sizeof(frame) - 1);
   if (!encodedSize) return;
@@ -67,75 +34,68 @@ void send(const Cbor& payload, wire::Type type, uint32_t seq) {
 }
 
 void sendHello() {
-  Cbor out(outgoing);
-  out.map(3);
-  out.number(0); out.string("bluepill-simulator");
-  out.number(1); out.number(kBootId);
-  out.number(2); out.number(kSchemaRevision);
+  JsonDocument out;
+  out["device_id"] = "bluepill-simulator";
+  out["boot_id"] = kBootId;
+  out["schema_revision"] = kSchemaRevision;
   send(out, wire::Type::Hello, ++sequence);
 }
 
-void describe(Cbor& out, uint32_t id, const char* key, const char* label,
+void describe(JsonArray fields, uint32_t id, const char* key, const char* label,
               const char* type, const char* unit) {
-  out.map(7);
-  out.string("id"); out.number(id);
-  out.string("key"); out.string(key);
-  out.string("name"); out.string(label);
-  out.string("type"); out.string(type);
-  out.string("unit"); out.string(unit);
-  out.string("access"); out.string("read");
-  out.string("period_ms"); out.number(200);
+  JsonObject field = fields.add<JsonObject>();
+  field["id"] = id;
+  field["key"] = key;
+  field["name"] = label;
+  field["type"] = type;
+  field["unit"] = unit;
+  field["access"] = "read";
+  field["period_ms"] = 200;
 }
 
 void sendSchema() {
-  Cbor out(outgoing);
-  out.map(4);
-  out.number(0); out.number(kSchemaRevision);
-  out.number(1); out.number(0);
-  out.number(2); out.number(1);
-  out.number(3); out.array(4);
-  describe(out, kBatteryVoltage, "drive_battery_voltage", "Battery voltage", "uint32", "mV");
-  describe(out, kBatteryTemperature, "drive_battery_temperature", "Battery temperature", "int32", "degC");
-  describe(out, kDistance, "distance", "Simulated distance", "uint32", "mm");
-  describe(out, kMoving, "moving", "Simulated motion", "bool", "");
+  JsonDocument out;
+  out["revision"] = kSchemaRevision;
+  out["part_index"] = 0;
+  out["parts_total"] = 1;
+  JsonArray fields = out["fields"].to<JsonArray>();
+  describe(fields, kBatteryVoltage, "drive_battery_voltage", "Battery voltage", "uint32", "mV");
+  describe(fields, kBatteryTemperature, "drive_battery_temperature", "Battery temperature", "int32", "degC");
+  describe(fields, kDistance, "distance", "Simulated distance", "uint32", "mm");
+  describe(fields, kMoving, "moving", "Simulated motion", "bool", "");
   send(out, wire::Type::Schema, ++sequence);
 }
 
 void sendTelemetry(uint32_t now) {
-  Cbor out(outgoing);
-  out.map(3);
-  out.number(0); out.number(kBootId);
-  out.number(1); out.number(now);
-  out.number(2); out.map(4);
-  out.number(kBatteryVoltage); out.number(24700 - (now / 1000) % 500);
-  out.number(kBatteryTemperature); out.number(35 + (now / 5000) % 5);
-  out.number(kDistance); out.number(distanceMm);
-  out.number(kMoving); out.boolean(moving);
+  JsonDocument out;
+  out["boot_id"] = kBootId;
+  out["sample_ms"] = now;
+  JsonObject values = out["values"].to<JsonObject>();
+  values["drive_battery_voltage"] = 24700 - (now / 1000) % 500;
+  values["drive_battery_temperature"] = 35 + (now / 5000) % 5;
+  values["distance"] = distanceMm;
+  values["moving"] = moving;
   send(out, wire::Type::Telemetry, ++sequence);
 }
 
 void sendErrors() {
-  Cbor out(outgoing);
-  out.map(3);
-  out.number(0); out.number(kBootId);
-  out.number(1); out.number(errorRevision);
-  out.number(2); out.array(fault ? 1 : 0);
+  JsonDocument out;
+  out["boot_id"] = kBootId;
+  out["revision"] = errorRevision;
+  JsonArray active = out["active"].to<JsonArray>();
   if (fault) {
-    out.map(3);
-    out.string("source"); out.string("simulator");
-    out.string("code"); out.number(1);
-    out.string("severity"); out.string("fault");
+    JsonObject error = active.add<JsonObject>();
+    error["source"] = "simulator";
+    error["code"] = 1;
+    error["severity"] = "fault";
   }
   send(out, wire::Type::ErrorsSnapshot, ++sequence);
 }
 
 void sendResult(uint32_t request, const char* reason) {
-  Cbor out(outgoing);
-  out.map(reason ? 2 : 1);
-  out.string("status"); out.string(reason ? "rejected" : "completed");
-  if (reason) {
-    out.string("reason"); out.string(reason);
-  }
+  JsonDocument out;
+  out["status"] = reason ? "rejected" : "completed";
+  if (reason) out["reason"] = reason;
   send(out, wire::Type::CommandResult, request);
 }
 
@@ -144,36 +104,34 @@ void setFault(bool enabled) {
   fault = enabled;
   if (fault) moving = false;
   ++errorRevision;
-  Cbor out(outgoing);
-  out.map(6);
-  out.string("boot_id"); out.number(kBootId);
-  out.string("event_id"); out.number(errorRevision);
-  out.string("source"); out.string("simulator");
-  out.string("code"); out.number(1);
-  out.string("transition"); out.string(fault ? "raised" : "cleared");
-  out.string("time_ms"); out.number(millis());
+  JsonDocument out;
+  out["boot_id"] = kBootId;
+  out["event_id"] = errorRevision;
+  out["source"] = "simulator";
+  out["code"] = 1;
+  out["transition"] = fault ? "raised" : "cleared";
+  out["time_ms"] = millis();
   send(out, wire::Type::ErrorEvent, ++sequence);
 }
 
 const char* simulateCommand(const wire::Packet& packet) {
-  // Exact CBOR map {0: operation}, with a small integer encoded in one byte.
-  if (packet.size != 3 || packet.payload[0] != 0xa1 || packet.payload[1] != 0) {
+  JsonDocument command;
+  if (!payload::readCbor(packet, command)) return "invalid_simulator_command";
+  const JsonString op = command["op"].as<JsonString>();
+  if (op.isNull()) {
     return "invalid_simulator_command";
   }
-  switch (packet.payload[2]) {
-    case 1:
-      if (fault) return "simulated_fault_active";
-      moving = true;
-      return nullptr;
-    case 2:
-      setFault(true);
-      return nullptr;
-    case 3:
-      setFault(false);
-      return nullptr;
-    default:
-      return "unknown_simulator_operation";
+  if (op == "start") {
+    if (fault) return "simulated_fault_active";
+    moving = true;
+  } else if (op == "raise_fault") {
+    setFault(true);
+  } else if (op == "clear_fault") {
+    setFault(false);
+  } else {
+    return "unknown_simulator_operation";
   }
+  return nullptr;
 }
 
 void handle(const wire::Packet& packet) {

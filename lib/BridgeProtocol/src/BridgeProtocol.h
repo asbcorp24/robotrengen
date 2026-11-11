@@ -5,7 +5,8 @@
 
 // No Arduino dependency: shared wire protocol for ESP32, STM32 and host tests.
 namespace wire {
-constexpr uint8_t kVersion = 1;
+constexpr uint8_t kVersion = 2;  // BLE with JSON
+constexpr uint8_t kUartVersion = 3;  // UART with CBOR
 constexpr size_t kHeaderSize = 10;
 constexpr size_t kCrcSize = 4;
 constexpr size_t kMaxPayload = 1024;
@@ -41,8 +42,8 @@ uint32_t read32(const uint8_t* p);
 void write16(uint8_t* p, uint16_t value);
 void write32(uint8_t* p, uint32_t value);
 uint32_t crc32(const uint8_t* data, size_t size);
-size_t encodeRaw(const Packet& packet, uint8_t* out, size_t capacity);
-bool decodeRaw(const uint8_t* data, size_t size, Packet& packet);
+size_t encodeRaw(const Packet& packet, uint8_t* out, size_t capacity, uint8_t version = kVersion);
+bool decodeRaw(const uint8_t* data, size_t size, Packet& packet, uint8_t version = kVersion);
 size_t cobsEncode(const uint8_t* data, size_t size, uint8_t* out, size_t capacity);
 size_t cobsDecode(const uint8_t* data, size_t size, uint8_t* out, size_t capacity);
 bool allowedFromPhone(Type type);
