@@ -1,8 +1,8 @@
 import struct
 import unittest
 
-from tools.ble_tester import Bridge, Notifications, INFO, RX, TX
-from tools.stm32_simulator import COMMAND, TELEMETRY, fragments, json_payload, raw_packet
+from tools.ble_tester import App, Bridge, Notifications, INFO, RX, TX
+from tools.stm32_simulator import COMMAND, TELEMETRY, SCHEMA, fragments, json_payload, raw_packet
 
 
 class NotificationsTests(unittest.TestCase):
@@ -25,6 +25,29 @@ class NotificationsTests(unittest.TestCase):
         for chunk in chunks[:-1]:
             self.assertIsNone(reader.feed(chunk, 3.0))
         self.assertEqual(reader.feed(chunks[-1], 3.0), (TELEMETRY, 9, value))
+
+    def test_telemetry_groups_and_sources_are_preserved(self):
+        app = App.__new__(App)
+        app.total_packets = 0
+        app.values, app.fields, app.value_times = {}, {}, {}
+        app.source_boots, app.simulated_sources = {}, {}
+        app.status = type("Label", (), {"set": lambda *_: None})()
+        app.update_table = lambda: None
+        app.show_packet(TELEMETRY, 1, {
+            "source": "stm32", "boot_id": 1, "simulated": True,
+            "values": {"distance": 12.3}})
+        app.show_packet(TELEMETRY, 2, {
+            "source": "stm32", "boot_id": 1, "values": {"xray_error_mask": 0}})
+        app.show_packet(TELEMETRY, 1, {
+            "source": "esp32", "boot_id": 2, "values": {"ble_rssi_dbm": -64}})
+        self.assertEqual(app.values, {
+            "stm32/distance": 12.3, "stm32/xray_error_mask": 0, "esp32/ble_rssi_dbm": -64})
+        app.show_packet(SCHEMA, 5, {"source": "esp32", "fields": [{"key": "ble_rssi_dbm", "unit": "dBm"}]})
+        self.assertEqual(app.fields["esp32/ble_rssi_dbm"]["unit"], "dBm")
+        app.show_packet(TELEMETRY, 1, {
+            "source": "stm32", "boot_id": 3, "values": {"distance": 0}})
+        self.assertNotIn("stm32/xray_error_mask", app.values)
+        self.assertEqual(app.values["esp32/ble_rssi_dbm"], -64)
 
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):

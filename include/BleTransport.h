@@ -28,6 +28,9 @@ class BleTransport : private BLEServerCallbacks,
   uint32_t generation() const { return generation_.load(); }
   uint32_t rxDrops() const { return rxDrops_.load(); }
   uint16_t valueCapacity() const { return mtu_.load() - 3; }
+  uint8_t txPhy() const { return txPhy_.load(); }
+  uint8_t rxPhy() const { return rxPhy_.load(); }
+  bool readRssi(int8_t& rssi) const;
 
  private:
   using BLEServerCallbacks::onConnect;
@@ -72,6 +75,8 @@ class BleTransport : private BLEServerCallbacks,
   std::atomic<bool> phyPending_{false};
   ble_gap_event_listener phyListener_{};
   std::atomic<uint16_t> mtu_{23};
+  std::atomic<uint8_t> txPhy_{0};
+  std::atomic<uint8_t> rxPhy_{0};
   std::atomic<uint16_t> connectionId_{0xffff};
   std::atomic<uint32_t> generation_{0};
   std::atomic<uint32_t> rxDrops_{0};

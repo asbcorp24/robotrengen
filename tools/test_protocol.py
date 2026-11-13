@@ -28,6 +28,11 @@ def main():
         payload = root / "lib/BridgePayload/src"
         tests.append(["-I", str(payload), "-I", str(arduino_json),
                       str(payload / "BridgePayload.cpp"), str(root / "test/host/payload_test.cpp")])
+        tests.append(["-I", str(payload), "-I", str(arduino_json),
+                      "-I", str(root / "test/host/stubs"),
+                      "-I", str(root / "lib/TelemetryCatalog/src"),
+                      str(payload / "BridgePayload.cpp"), str(protocol / "BridgeProtocol.cpp"),
+                      str(root / "test/host/telemetry_test.cpp")])
     with tempfile.TemporaryDirectory(prefix="crawler-protocol-") as directory:
         binary = Path(directory) / ("protocol_test.exe" if os.name == "nt" else "protocol_test")
         for sources in tests:

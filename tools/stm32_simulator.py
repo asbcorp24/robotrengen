@@ -94,7 +94,7 @@ def main():
             ("phone_snapshot_request", SNAPSHOT_REQUEST, {}),
             ("phone_simulated_start", COMMAND, {"op": "start"}),
             ("phone_simulated_stop", STOP, {}),
-            ("stm32_telemetry", TELEMETRY, {"boot_id": 42, "sample_ms": 1000, "values": {"drive_battery_voltage": 24700, "drive_battery_temperature": 35}}),
+            ("stm32_telemetry", TELEMETRY, {"source": "stm32", "simulated": True, "group": "battery", "boot_id": 42, "sample_ms": 1000, "values": {"drive_battery_voltage": 24.7, "drive_battery_temperature": 35}}),
         ], start=1):
             raw = raw_packet(kind, sequence, json_payload(payload))
             print(json.dumps({"name": label, "payload": payload, "raw_hex": raw.hex(),
@@ -111,9 +111,9 @@ def main():
     boot_id = random.getrandbits(32)
     sequence = 0
     started = time.monotonic()
-    schema = {"revision": 1, "part_index": 0, "parts_total": 1, "fields": [
+    schema = {"source": "stm32", "revision": 2, "part_index": 0, "parts_total": 1, "fields": [
         {"id": 1001, "key": "drive_battery_voltage", "name": "Battery voltage",
-         "type": "uint32", "unit": "mV", "access": "read", "period_ms": 1000},
+         "type": "number", "unit": "V", "access": "read", "period_ms": 1000},
         {"id": 1002, "key": "drive_battery_temperature", "name": "Battery temperature",
          "type": "int32", "unit": "degC", "access": "read", "period_ms": 1000},
     ]}
@@ -126,8 +126,8 @@ def main():
 
         def snapshot():
             elapsed = int((time.monotonic() - started) * 1000) & 0xffffffff
-            send(TELEMETRY, {"boot_id": boot_id, "sample_ms": elapsed,
-                             "values": {"drive_battery_voltage": 24700, "drive_battery_temperature": 35}})
+            send(TELEMETRY, {"source": "stm32", "simulated": True, "group": "battery", "boot_id": boot_id, "sample_ms": elapsed,
+                             "values": {"drive_battery_voltage": 24.7, "drive_battery_temperature": 35}})
             send(ERRORS, {"boot_id": boot_id, "revision": 0, "active": []})
 
         print(f"STM32 simulator on {args.port}; commands are rejected; Ctrl+C to exit.")
@@ -154,7 +154,7 @@ def main():
                         raise ValueError("CBOR payload must be a map")
                     print(f"RX type=0x{kind:02x} seq={request_seq} payload={value}")
                     if kind == HELLO:
-                        send(HELLO, {"device_id": "stm32-simulator", "boot_id": boot_id, "schema_revision": 1})
+                        send(HELLO, {"device_id": "stm32-simulator", "boot_id": boot_id, "schema_revision": 2})
                     elif kind == SCHEMA_REQUEST:
                         send(SCHEMA, schema)
                     elif kind == SNAPSHOT_REQUEST:

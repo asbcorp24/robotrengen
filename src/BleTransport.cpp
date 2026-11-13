@@ -78,6 +78,8 @@ void BleTransport::onConnect(BLEServer* server, ble_gap_conn_desc* p) {
   subscribed_.store(false);
   phyPending_.store(false);
   mtu_.store(23);
+  txPhy_.store(BLE_GAP_LE_PHY_1M);
+  rxPhy_.store(BLE_GAP_LE_PHY_1M);
   generation_.fetch_add(1);
   restartAdvertising_.store(false);
   connected_.store(true);
@@ -93,6 +95,8 @@ void BleTransport::onDisconnect(BLEServer*, ble_gap_conn_desc* p) {
   subscribed_.store(false);
   phyPending_.store(false);
   connectionId_.store(0xffff);
+  txPhy_.store(0);
+  rxPhy_.store(0);
   generation_.fetch_add(1);
   restartAdvertising_.store(true);
 }
@@ -161,6 +165,11 @@ bool BleTransport::notify(const uint8_t* data, size_t size, uint32_t generation)
 bool BleTransport::receive(BleFragment& fragment) {
   return xQueueReceive(ingress_, &fragment, 0) == pdTRUE;
 }
+bool BleTransport::readRssi(int8_t& rssi) const {
+  const uint16_t handle = connectionId_.load();
+  return connected_.load() && handle != 0xffff && ble_gap_conn_rssi(handle, &rssi) == 0 &&
+         rssi != 127 && handle == connectionId_.load();
+}
 void BleTransport::recordEvent(const Event& event) {
   xQueueSend(events_, &event, 0);
 }
@@ -173,6 +182,8 @@ int BleTransport::onGapEvent(ble_gap_event* event, void* context) {
     if (phy.status == 0) {
       report.txPhy = phy.tx_phy;
       report.rxPhy = phy.rx_phy;
+      self.txPhy_.store(phy.tx_phy);
+      self.rxPhy_.store(phy.rx_phy);
     }
     self.recordEvent(report);
   }

@@ -183,19 +183,21 @@ ErrorsSnapshot:  boot_id, revision, active (массив)
 
 ```json
 {
+  "source": "stm32",
+  "simulated": true,
+  "group": "battery",
   "boot_id": 1,
   "sample_ms": 1200,
   "values": {
-    "drive_battery_voltage": 24700,
+    "drive_battery_voltage": 24.7,
     "drive_battery_temperature": 35,
-    "distance": 500,
-    "moving": true
+    "drive_battery_soc": 85
   }
 }
 ```
 
-Элемент массива `fields` содержит `id`, `key`, `name`, `type`, `unit`, `access`
-и `period_ms`. Каждый ключ в `values` соответствует `key` из реестра.
+Элемент массива `fields` содержит `key`, `name`, `type`, `unit`, `access`,
+`group` и `period_ms`. Каждый ключ в `values` соответствует `key` из реестра.
 Новые измерения добавляются на STM32 в реестр и в объект `values`.
 Приложение может отобразить новые поля по реестру.
 
@@ -261,11 +263,73 @@ BLE-терминал должен писать **байты hex**, а не ст�
 ## Проверка на STM32 Blue Pill
 
 Прошивка `src/bluepill/main.cpp` имитирует контроллер на STM32F103C8T6.
-Blue Pill передаёт телеметрию каждые 200 мс и снимок
+Blue Pill передаёт быстрые группы телеметрии каждые 200 мс и снимок
 активных ошибок раз в секунду. `Hello`, `SchemaRequest` и `SnapshotRequest`
 возвращают идентификатор стенда, реестр полей и текущие значения соответственно.
 Идентификатор загрузки в стендовой модели фиксирован. Состояние модели
 хранится в RAM и сбрасывается при перезагрузке.
+
+### Телеметрия STM32 и ESP32
+
+Реестр версии 2 определён в `lib/TelemetryCatalog/src/TelemetryCatalog.h`.
+Blue Pill передаёт 34 поля по UART в CBOR. ESP32 преобразует их в JSON
+и отправляет вместе с собственной телеметрией.
+
+Каждое сообщение Telemetry содержит `source` (`stm32` или `esp32`),
+`boot_id`, `sample_ms`, `group`, `simulated` и объект `values`.
+Это полный снимок одной группы. Клиент объединяет группы по паре
+`source/key`, хранит время обновления каждого поля и показывает устаревание.
+Снимок группы аккумуляторов не удаляет значения движения или ESP32.
+
+| Группа STM32 | Ключи | Единицы / смысл |
+|---|---|---|
+| motion, 5 Гц | `distance`, `moving`, `crawler_state` | м с шагом 0,1 м, признак движения, состояние |
+| motion, 5 Гц | `roll`, `pitch` | градусы с шагом 0,1° |
+| motion, 5 Гц | `sensor_start_triggered`, `sensor_end_triggered`, `sensor_water_triggered`, `sensor_obstacle_triggered` | Срабатывание датчиков, true/false |
+| motion, 5 Гц | `brake_force_pct`, `brake_command_pct` | Измеренное усилие и задание тормоза, % |
+| battery, 1 Гц | `odometer_km` | Общий пробег, км |
+| battery, 1 Гц | `drive_battery_voltage`, `drive_battery_current`, `drive_battery_temperature`, `drive_battery_soc` | Ходовой АКБ, В / А / °C / % |
+| battery, 1 Гц | `xray_battery_voltage`, `xray_battery_current`, `xray_battery_temperature`, `xray_battery_soc` | Рентгеновский АКБ, В / А / °C / % |
+| xray, 5 Гц | `xray_state`, `xray_voltage`, `xray_current` | Состояние, кВ, мА |
+| xray, 5 Гц | `exposure_remaining_s`, `exposure_delay_remaining_s` | Оставшееся время экспозиции и задержки, с |
+| xray, 5 Гц | `xray_error_mask` | 16-битная маска, бит 0 — ошибка 1, бит 15 — ошибка 16 |
+| diagnostics, 1 Гц | `magnetic_signal_pct` | Массив уровней приёмников, % |
+| diagnostics, 1 Гц | `imu_health`, `tof_health`, `analog_health` | Исправность ASM330LHHX, VL53L4ED и аналоговых каналов |
+| diagnostics, 1 Гц | `sensor_start_health`, `sensor_end_health`, `sensor_water_health`, `sensor_obstacle_health` | Исправность датчиков, отдельно от срабатывания |
+
+Положительный ток означает разряд, отрицательный — заряд. SOC передаётся уже
+рассчитанным STM32 либо полученным от BMS. Состояния аппарата имеют значения
+`forbidden`, `errors`, `training_required`, `ready`.
+Статусы исправности могут быть `ok`, `fault`, `timeout`, `unknown`.
+Недоступное измерение имеет значение `null`. Расшифровки кодов ошибок
+добавляются после получения перечня аппарата.
+
+Blue Pill пока моделирует эти данные с `simulated:true`. Число магнитных
+приёмников для стенда принято равным двум. Кнопка «Вызвать ошибку» включает
+бит 0 маски и активную ошибку `xray/1`. Измеренное усилие тормоза равно
+`null`, а задание отдельно меняется между 0 и 65%. Обратный отсчёт и
+экспозиция пока равны нулю. Пробег в модели начинается со 100 км и
+накапливается в RAM. Сохранение во FRAM/flash и драйверы реальных датчиков
+должны быть реализованы на рабочем контроллере.
+
+ESP32 раз в секунду передаёт группу `bridge` с `simulated:false`.
+Она содержит время работы, свободную RAM, минимальную свободную RAM, RSSI в
+**dBm** на стороне ESP32, согласованный MTU, фактические TX/RX PHY, состояние
+UART и возраст последнего пакета STM32, счётчики UART/BLE и потерь.
+Ключи перечислены в `kEsp32Fields`. RSSI при ошибке чтения равен `null`.
+Связь со STM32 считается устаревшей через 2 секунды без корректного пакета.
+Эта телеметрия продолжает поступать при отключённой Blue Pill.
+
+SchemaRequest возвращает реестры обоих источников отдельными страницами
+по два поля. Страницы каждого источника отправляются с интервалом 700 мс.
+Поля добавляются в таблицу тестера по мере получения реестра. Полный реестр
+STM32 поступает примерно за 12 секунд.
+Для полного набора при 5 Гц используйте согласованный MTU 247 и проверяйте
+счётчики потерь. При MTU 23 пропускной способности текущей фрагментации
+недостаточно для всех групп на заданной частоте.
+
+Единицы `distance` и напряжения в реестре версии 2 — м и В соответственно.
+После обновления прошивок обновите также Python-тестер.
 
 После сопряжения и подписки на TX можно проверить ответы на команды:
 
@@ -290,6 +354,254 @@ python tools/stm32_simulator.py --example
 По очереди запишите строки из `ble_mtu23_hex` как hex-байты в RX с подтверждением записи.
 При работе через своё приложение сериализуйте JSON в UTF-8 и сформируйте пакет
 v2 с новым sequence.
+
+## Формирование данных на реальном STM32
+
+На рабочем контроллере используйте тот же UART-протокол v3. Источники значений —
+драйверы энкодера, АКБ/BMS, датчиков, тормоза и интерфейса рентгеновского аппарата.
+Сначала соберите согласованный снимок состояния, затем сформируйте CBOR и
+поставьте полный UART-кадр в очередь передачи.
+
+### Содержимое сообщения Telemetry
+
+| Поле | Что записывает STM32 |
+|---|---|
+| `source` | Строку `"stm32"` |
+| `simulated` | `false` для измерений рабочего контроллера |
+| `boot_id` | uint32, идентификатор запуска, меняющийся после перезапуска |
+| `sample_ms` | uint32, время снимка от старта STM32 в миллисекундах |
+| `group` | `"motion"`, `"battery"`, `"xray"` или `"diagnostics"` |
+| `values` | Карту со строковыми ключами из реестра и типизированными значениями |
+
+Числа передавайте числами, логические состояния — bool. Единицы храните
+в реестре. Например, напряжение 24,7 В передаётся числом `24.7`.
+Параметры преобразуйте в единицы реестра до сериализации.
+Следующий объект показывает содержимое карты CBOR в читаемом виде.
+
+```json
+{
+  "source": "stm32",
+  "simulated": false,
+  "boot_id": 103,
+  "sample_ms": 182000,
+  "group": "battery",
+  "values": {
+    "odometer_km": 125,
+    "drive_battery_voltage": 24.7,
+    "drive_battery_current": 8.5,
+    "drive_battery_temperature": 36,
+    "drive_battery_soc": 82,
+    "xray_battery_voltage": 48.2,
+    "xray_battery_current": 0.2,
+    "xray_battery_temperature": null,
+    "xray_battery_soc": 90
+  }
+}
+```
+
+`null` означает, что актуальное достоверное измерение недоступно. Например,
+при таймауте температурного датчика записывайте `null`, а в группе диагностики
+обновляйте соответствующее состояние. Значение 0 используйте для реально
+измеренного нуля. При каждом периодическом снимке передавайте все поля группы,
+включая недоступные поля с `null`.
+
+Идентификатор запуска нужен клиенту для сброса старых значений после
+перезагрузки STM32. Для STM32F103 можно использовать счётчик запусков
+в энергонезависимой памяти. Фиксированный `boot_id=1` в текущей Blue Pill
+оставлен только для стендовой модели.
+
+### Пример формирования кадра в C++
+
+Пример использует модули `BridgeProtocol`, `BridgePayload` и ArduinoJson
+из проекта. Они позволяют собрать пакет и при работе с STM32 HAL.
+Входной `BatterySnapshot` заполняет ваш слой измерений.
+
+```cpp
+#include <BridgePayload.h>
+#include <BridgeProtocol.h>
+
+struct BatteryReading {
+  float voltageV;
+  float currentA;
+  float temperatureC;
+  uint8_t socPct;
+  bool voltageValid;
+  bool currentValid;
+  bool temperatureValid;
+  bool socValid;
+};
+
+struct BatterySnapshot {
+  BatteryReading drive;
+  BatteryReading xray;
+  uint32_t odometerKm;
+  bool odometerValid;
+};
+
+static void setReading(JsonObject values, const char* key, float reading, bool valid) {
+  if (valid) values[key] = reading;
+  else values[key] = nullptr;
+}
+
+// Возвращает полную длину кадра с разделителем либо 0 при ошибке.
+// Вызывать из одной задачи сериализации. Статические буферы не реентерабельны.
+size_t buildBatteryFrame(const BatterySnapshot& snapshot,
+                         uint32_t bootId, uint32_t sequence, uint32_t sampleMs,
+                         uint8_t* frame, size_t frameCapacity) {
+  static wire::Packet packet;
+  static uint8_t raw[wire::kMaxRaw];
+  JsonDocument doc;
+  doc["source"] = "stm32";
+  doc["simulated"] = false;
+  doc["boot_id"] = bootId;
+  doc["sample_ms"] = sampleMs;
+  doc["group"] = "battery";
+  JsonObject values = doc["values"].to<JsonObject>();
+
+  if (snapshot.odometerValid) values["odometer_km"] = snapshot.odometerKm;
+  else values["odometer_km"] = nullptr;
+
+  setReading(values, "drive_battery_voltage",
+             snapshot.drive.voltageV, snapshot.drive.voltageValid);
+  setReading(values, "drive_battery_current",
+             snapshot.drive.currentA, snapshot.drive.currentValid);
+  setReading(values, "drive_battery_temperature",
+             snapshot.drive.temperatureC, snapshot.drive.temperatureValid);
+  setReading(values, "drive_battery_soc",
+             snapshot.drive.socPct, snapshot.drive.socValid);
+  setReading(values, "xray_battery_voltage",
+             snapshot.xray.voltageV, snapshot.xray.voltageValid);
+  setReading(values, "xray_battery_current",
+             snapshot.xray.currentA, snapshot.xray.currentValid);
+  setReading(values, "xray_battery_temperature",
+             snapshot.xray.temperatureC, snapshot.xray.temperatureValid);
+  setReading(values, "xray_battery_soc",
+             snapshot.xray.socPct, snapshot.xray.socValid);
+
+  // Пакет должен поместиться после преобразования ESP32 в JSON.
+  if (doc.overflowed() || measureJson(doc) > wire::kMaxPayload ||
+      !payload::writeCbor(doc.as<JsonVariantConst>(), packet)) return 0;
+  packet.type = wire::Type::Telemetry;
+  packet.sequence = sequence;
+  const size_t rawSize =
+      wire::encodeRaw(packet, raw, sizeof(raw), wire::kUartVersion);
+  if (!rawSize || frameCapacity < 2) return 0;
+  const size_t encodedSize =
+      wire::cobsEncode(raw, rawSize, frame, frameCapacity - 1);
+  if (!encodedSize) return 0;
+  frame[encodedSize] = 0;
+  return encodedSize + 1;
+}
+```
+
+Размер выходного буфера — минимум `wire::kMaxEncoded + 1`, то есть 1044 байта.
+Передайте ровно возвращённое число байтов через UART 115200, 8N1.
+Для Arduino это `serial.write(frame, size)`. Для HAL — вызов передачи
+через выбранный UART. При использовании DMA или прерываний буфер должен
+оставаться неизменным до завершения передачи. Практический вариант —
+очередь кадров, где каждый элемент владеет своими байтами, а следующая
+передача начинается из обработчика завершения предыдущей.
+
+CRC и COBS уже формируют общие функции. Заголовок содержит версию UART
+`3`, тип `0x10`, нулевые flags, длину CBOR и sequence. CRC охватывает
+заголовок и CBOR. Завершающий `0x00` отделяет UART-кадры.
+ESP32 проверяет кадр, преобразует CBOR в JSON и формирует BLE-пакет v2.
+STM32 не требуется готовить BLE-фрагменты.
+
+Для прошивки на C с HAL можно использовать собственный CBOR-кодек,
+сохраняя описанный формат кадра. Ключи карты должны быть строками, контейнеры
+иметь определённую длину. Поддерживаемый набор значений — числа, строки,
+bool, null, массивы и вложенные карты. Максимальная вложенность — 8.
+
+### Откуда брать значения и когда их отправлять
+
+Заполняйте `BatterySnapshot` после пересчёта АЦП в физические величины
+либо чтения BMS. Срок годности измерения и проверку диапазона определяет
+драйвер или слой диагностики. В valid-флаг включайте успешность измерения,
+допустимый возраст данных и конечность числа. Для float исключайте NaN и Infinity.
+
+Параметры из ISR/DMA сначала копируйте в снимок под короткой критической
+секцией, мьютексом или другим механизмом согласованного чтения.
+Формирование CBOR и ожидание UART выполняйте после освобождения снимка.
+Sequence увеличивайте для каждого нового сообщения STM32 независимо от группы.
+Время `sample_ms` относится к моменту снимка.
+
+| Группа | Источники рабочего контроллера | Период |
+|---|---|---|
+| motion | Энкодер и направление, автомат состояний, входы датчиков, фильтр IMU, обратная связь тормоза | 200 мс |
+| xray | Мониторные значения и состояние из интерфейса аппарата, таймеры контроллера, маска ошибок | 200 мс |
+| battery | АЦП/датчики тока, температурные датчики, BMS или расчёт SOC, накопленный пробег | 1000 мс |
+| diagnostics | Результаты самодиагностики, таймауты драйверов, уровни магнитных приёмников после калибровки | 1000 мс |
+
+Расстояние от исходной позиции рассчитывайте со знаком направления и
+передавайте в метрах с шагом 0,1 м. Общий пробег накапливайте по абсолютному
+пути в целочисленных единицах достаточной разрядности, например uint64 в мм.
+В `odometer_km` передавайте целые километры. Сброс исходной позиции не
+сбрасывает общий пробег. Для сохранения пробега используйте FRAM или журнал
+flash с контролем целостности. Сохранение при пропадании питания требует
+обнаружения отключения и достаточного запаса энергии на запись.
+
+Срабатывание датчика и его исправность заполняйте независимо. При
+неисправности измерительного канала возвращайте `null` в его значении,
+а состояние неисправности передавайте отдельным полем диагностики.
+Проценты тормоза относятся к измеренному усилию только при наличии
+калиброванной обратной связи. Задание привода передавайте в `brake_command_pct`.
+
+### Ошибки реального аппарата
+
+В `xray_error_mask` передавайте число от 0 до 65535. При появлении ошибки
+с кодом N устанавливайте бит N−1. Например, одновременно активные ошибки
+1 и 4 дают маску `9`. В периодическом ErrorsSnapshot передавайте полный
+список активных ошибок.
+
+```json
+{
+  "source": "stm32",
+  "simulated": false,
+  "boot_id": 103,
+  "revision": 12,
+  "active": [
+    {"source": "xray", "code": 1, "severity": "fault"},
+    {"source": "xray", "code": 4, "severity": "fault"}
+  ]
+}
+```
+
+Эту карту сериализуйте теми же функциями с типом `ErrorsSnapshot` (`0x11`).
+При изменении списка увеличивайте revision. Пустой массив `active:[]`
+означает отсутствие активных ошибок. Контроллерные неисправности можно
+включать в этот список с другим источником, например `"controller"`.
+
+При появлении и исчезновении ошибки отправляйте также ErrorEvent (`0x12`)
+с полями `source:"stm32"`, `subsystem:"xray"`, `boot_id`, `simulated:false`,
+`event_id`, `code`, `transition` (`raised` или `cleared`) и `time_ms`.
+Для надёжного журнала реализуйте хранение событий и повторы до EventAck.
+Текущий стендовый код отправляет события без такого журнала.
+
+### Ответы на запросы и добавление параметров
+
+Обрабатывайте входящий UART через `wire::UartDecoder`. После успешной
+проверки кадра разбирайте CBOR. На Hello возвращайте идентификатор устройства,
+актуальные boot_id и schema_revision. На SnapshotRequest отправляйте
+свежие снимки всех групп и ErrorsSnapshot.
+
+На SchemaRequest отправляйте Schema (`0x03`) с `source:"stm32"`,
+`revision`, `part_index`, `parts_total` и массивом `fields`.
+В проекте это делает `catalog::schemaPage()`. Пакет содержит два описания,
+индексы начинаются с нуля. Разносите отправку страниц по времени, чтобы
+телеметрия и команды продолжали обслуживаться.
+
+Чтобы добавить измерение, заведите постоянный строковый key, добавьте
+описание в `kStm32Fields` и значение в снимок нужной группы. Укажите
+имя, тип, единицы и период и увеличьте `catalog::kRevision`.
+ESP32 автоматически преобразует новое поле, а тестер покажет его по реестру.
+При изменении смысла или единиц существующего параметра используйте новый
+key, чтобы клиенты могли однозначно различать значения.
+
+Проверьте размер каждого снимка в CBOR и в JSON. Для больших групп введите
+дополнительные имена групп и описания в реестре. Ограничение payload —
+1024 байта в каждом формате. Проверять можно локальными тестами из раздела
+выше и BLE-тестером, в том числе при отключении датчика и перезапуске STM32.
 
 ## BLE-тестер для компьютера на Python
 

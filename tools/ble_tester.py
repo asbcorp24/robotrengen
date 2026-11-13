@@ -137,6 +137,10 @@ class App:
         self.closing = False
         self.fields = {}
         self.values = {}
+        self.value_times = {}
+        self.source_boots = {}
+        self.simulated_sources = {}
+        self.last_refresh = 0.0
         self.total_packets = 0
         self.last_telemetry = None
 
@@ -160,13 +164,19 @@ class App:
         ttk.Label(panel, textvariable=self.status, wraplength=590).pack(anchor="w", pady=(8, 2))
         ttk.Label(panel, textvariable=self.traffic).pack(anchor="w")
 
-        self.table = ttk.Treeview(panel, columns=("value", "unit"), height=8)
+        table_frame = ttk.Frame(panel)
+        table_frame.pack(fill="both", expand=True, pady=8)
+        self.table = ttk.Treeview(table_frame, columns=("value", "unit"), height=8)
         self.table.heading("#0", text="Параметр")
         self.table.heading("value", text="Значение")
         self.table.heading("unit", text="Ед.")
         self.table.column("value", width=145)
         self.table.column("unit", width=75, stretch=False)
-        self.table.pack(fill="both", expand=True, pady=8)
+        self.table.column("#0", width=430, minwidth=260)
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.table.configure(yscrollcommand=scrollbar.set)
+        self.table.pack(side="left", fill="both", expand=True)
         self.errors = tk.StringVar(value="Ошибки: ожидание снимка")
         ttk.Label(panel, textvariable=self.errors, wraplength=590).pack(anchor="w")
 
@@ -225,6 +235,9 @@ class App:
             return
         self.fields.clear()
         self.values.clear()
+        self.value_times.clear()
+        self.source_boots.clear()
+        self.simulated_sources.clear()
         self.update_table()
         self.total_packets = 0
         self.last_telemetry = None
@@ -273,6 +286,7 @@ class App:
         self.connected = False
         self.last_telemetry = None
         self.values.clear()
+        self.value_times.clear()
         self.update_table()
         self.errors.set("Ошибки: нет связи")
         self.status.set("Отключено.")
@@ -285,22 +299,42 @@ class App:
         for key in dict.fromkeys((*self.fields, *self.values)):
             field = self.fields.get(key, {})
             value = self.values.get(key)
-            display = "—" if key not in self.values else (
+            display = "—" if key not in self.values or value is None else (
                 value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))
-            self.table.insert("", "end", text=field.get("name", key),
+            source, _, raw_key = key.partition("/")
+            if key in self.value_times and time.monotonic() - self.value_times[key] > 3:
+                display = f"{display} (устарело)"
+            label = field.get("name", raw_key)
+            simulation = " • имитация" if self.simulated_sources.get(source) else ""
+            self.table.insert("", "end", text=f"{source.upper()}{simulation} / {label}",
                               values=(display, field.get("unit", "")))
 
     def show_packet(self, kind, sequence, value):
         self.total_packets += 1
+        source = value.get("source", "stm32")
+        if not isinstance(source, str):
+            return
         if kind == TELEMETRY and isinstance(value.get("values"), dict):
-            self.values = value["values"]
-            self.last_telemetry = time.monotonic()
+            boot = value.get("boot_id")
+            if source in self.source_boots and self.source_boots[source] != boot:
+                for key in list(self.values):
+                    if key.startswith(source + "/"):
+                        self.values.pop(key, None)
+                        self.value_times.pop(key, None)
+            self.source_boots[source] = boot
+            self.simulated_sources[source] = value.get("simulated", False)
+            now = time.monotonic()
+            for key, reading in value["values"].items():
+                qualified = f"{source}/{key}"
+                self.values[qualified] = reading
+                self.value_times[qualified] = now
+            self.last_telemetry = now
             self.status.set("Подключено. Телеметрия поступает.")
             self.update_table()
         elif kind == SCHEMA and isinstance(value.get("fields"), list):
             for field in value["fields"]:
                 if isinstance(field, dict) and isinstance(field.get("key"), str):
-                    self.fields[field["key"]] = field
+                    self.fields[f"{source}/{field['key']}"] = field
             self.update_table()
         elif kind == ERRORS and isinstance(value.get("active"), list):
             active = value["active"]
@@ -337,6 +371,9 @@ class App:
                 self.log(data)
         age = "—" if self.last_telemetry is None else f"{time.monotonic() - self.last_telemetry:.1f} с назад"
         self.traffic.set(f"Пакеты: {self.total_packets}   •   Последняя телеметрия: {age}")
+        if time.monotonic() - self.last_refresh >= 1:
+            self.last_refresh = time.monotonic()
+            self.update_table()
         self.root.after(80, self.poll)
 
     def close(self):

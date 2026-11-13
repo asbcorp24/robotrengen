@@ -2,22 +2,22 @@
 #include <BridgePayload.h>
 #include <BridgeProtocol.h>
 #include <Serial.h>
+#include <TelemetryCatalog.h>
+#include <math.h>
 #include <string.h>
 
 namespace {
 constexpr uint32_t kBootId = 1;  // Fixed identifier for the bench simulator.
-constexpr uint32_t kSchemaRevision = 1;
-constexpr uint32_t kBatteryVoltage = 1001;
-constexpr uint32_t kBatteryTemperature = 1002;
-constexpr uint32_t kDistance = 1101;
-constexpr uint32_t kMoving = 1301;
-
 Uart bridge(PA_10, PA_9);  // USART1: RX, TX.
 wire::UartDecoder decoder;
 wire::Packet incoming, outgoing;
 uint8_t raw[wire::kMaxRaw];
 uint8_t frame[wire::kMaxEncoded + 1];
 uint32_t sequence = 0, errorRevision = 0, distanceMm = 0;
+uint64_t travelMm = 0;  // Volatile model; hardware odometer will require persistent storage.
+uint32_t lastSlowTelemetry = 0, lastSchema = 0;
+size_t schemaPage = 0;
+bool schemaRequested = false;
 uint32_t lastTick = 0, lastTelemetry = 0, lastErrors = 0;
 bool moving = false, fault = false;
 
@@ -35,57 +35,110 @@ void send(const JsonDocument& doc, wire::Type type, uint32_t seq) {
 
 void sendHello() {
   JsonDocument out;
+  out["source"] = "stm32";
+  out["simulated"] = true;
   out["device_id"] = "bluepill-simulator";
   out["boot_id"] = kBootId;
-  out["schema_revision"] = kSchemaRevision;
+  out["schema_revision"] = catalog::kRevision;
   send(out, wire::Type::Hello, ++sequence);
 }
 
-void describe(JsonArray fields, uint32_t id, const char* key, const char* label,
-              const char* type, const char* unit) {
-  JsonObject field = fields.add<JsonObject>();
-  field["id"] = id;
-  field["key"] = key;
-  field["name"] = label;
-  field["type"] = type;
-  field["unit"] = unit;
-  field["access"] = "read";
-  field["period_ms"] = 200;
+void sendSchema() {
+  schemaPage = 0;
+  schemaRequested = true;
+  lastSchema = millis() - 700;
 }
 
-void sendSchema() {
+void sendSchemaPage(uint32_t now) {
+  if (!schemaRequested || now - lastSchema < 700) return;
   JsonDocument out;
-  out["revision"] = kSchemaRevision;
-  out["part_index"] = 0;
-  out["parts_total"] = 1;
-  JsonArray fields = out["fields"].to<JsonArray>();
-  describe(fields, kBatteryVoltage, "drive_battery_voltage", "Battery voltage", "uint32", "mV");
-  describe(fields, kBatteryTemperature, "drive_battery_temperature", "Battery temperature", "int32", "degC");
-  describe(fields, kDistance, "distance", "Simulated distance", "uint32", "mm");
-  describe(fields, kMoving, "moving", "Simulated motion", "bool", "");
+  catalog::schemaPage(out, "stm32", catalog::kStm32Fields, schemaPage);
   send(out, wire::Type::Schema, ++sequence);
+  lastSchema = now;
+  if (++schemaPage == catalog::pageCount(catalog::kStm32Fields)) schemaRequested = false;
+}
+
+JsonObject telemetryGroup(JsonDocument& out, const char* group, uint32_t now) {
+  out["source"] = "stm32";
+  out["simulated"] = true;
+  out["boot_id"] = kBootId;
+  out["sample_ms"] = now;
+  out["group"] = group;
+  return out["values"].to<JsonObject>();
+}
+
+void sendFastTelemetry(uint32_t now) {
+  JsonDocument out;
+  JsonObject values = telemetryGroup(out, "motion", now);
+  values["distance"] = (distanceMm / 100) / 10.0;  // 0.1 m reporting step.
+  values["moving"] = moving;
+  values["crawler_state"] = moving ? "moving" : "stop";
+  values["sensor_start_triggered"] = false;
+  values["sensor_end_triggered"] = false;
+  values["sensor_water_triggered"] = false;
+  values["sensor_obstacle_triggered"] = false;
+  values["roll"] = round(sin(now / 5000.0) * 25) / 10.0;
+  values["pitch"] = round(cos(now / 6000.0) * 15) / 10.0;
+  values["brake_command_pct"] = moving ? 0 : 65;
+  // No force sensor on the bench; report unavailable rather than a PWM value.
+  values["brake_force_pct"] = nullptr;
+  send(out, wire::Type::Telemetry, ++sequence);
+
+  out.clear();
+  values = telemetryGroup(out, "xray", now);
+  values["xray_state"] = fault ? "errors" : "ready";
+  values["xray_voltage"] = 0;
+  values["xray_current"] = 0;
+  values["exposure_remaining_s"] = 0;
+  values["exposure_delay_remaining_s"] = 0;
+  values["xray_error_mask"] = fault ? 1 : 0;  // Bit 0 represents error code 1.
+  send(out, wire::Type::Telemetry, ++sequence);
+}
+
+void sendSlowTelemetry(uint32_t now) {
+  JsonDocument out;
+  JsonObject values = telemetryGroup(out, "battery", now);
+  values["odometer_km"] = 100 + static_cast<uint32_t>(travelMm / 1000000);
+  values["drive_battery_voltage"] = (247 - (now / 10000) % 5) / 10.0;
+  values["drive_battery_current"] = moving ? 8.5 : 0.4;  // Positive = discharge.
+  values["drive_battery_temperature"] = 35 + (now / 5000) % 5;
+  values["drive_battery_soc"] = 85;
+  values["xray_battery_voltage"] = 48.2;
+  values["xray_battery_current"] = 0.2;
+  values["xray_battery_temperature"] = 32;
+  values["xray_battery_soc"] = 90;
+  send(out, wire::Type::Telemetry, ++sequence);
+
+  out.clear();
+  values = telemetryGroup(out, "diagnostics", now);
+  JsonArray magnetic = values["magnetic_signal_pct"].to<JsonArray>();
+  magnetic.add(42 + (now / 1000) % 10);
+  magnetic.add(50 + (now / 1500) % 10);  // Two simulated receivers.
+  values["imu_health"] = "ok";
+  values["tof_health"] = "ok";
+  values["analog_health"] = "ok";
+  values["sensor_start_health"] = "ok";
+  values["sensor_end_health"] = "ok";
+  values["sensor_water_health"] = "ok";
+  values["sensor_obstacle_health"] = "ok";
+  send(out, wire::Type::Telemetry, ++sequence);
 }
 
 void sendTelemetry(uint32_t now) {
-  JsonDocument out;
-  out["boot_id"] = kBootId;
-  out["sample_ms"] = now;
-  JsonObject values = out["values"].to<JsonObject>();
-  values["drive_battery_voltage"] = 24700 - (now / 1000) % 500;
-  values["drive_battery_temperature"] = 35 + (now / 5000) % 5;
-  values["distance"] = distanceMm;
-  values["moving"] = moving;
-  send(out, wire::Type::Telemetry, ++sequence);
+  sendFastTelemetry(now);
+  sendSlowTelemetry(now);
 }
 
 void sendErrors() {
   JsonDocument out;
   out["boot_id"] = kBootId;
+  out["source"] = "stm32";
+  out["simulated"] = true;
   out["revision"] = errorRevision;
   JsonArray active = out["active"].to<JsonArray>();
   if (fault) {
     JsonObject error = active.add<JsonObject>();
-    error["source"] = "simulator";
+    error["source"] = "xray";
     error["code"] = 1;
     error["severity"] = "fault";
   }
@@ -94,6 +147,7 @@ void sendErrors() {
 
 void sendResult(uint32_t request, const char* reason) {
   JsonDocument out;
+  out["source"] = "stm32";
   out["status"] = reason ? "rejected" : "completed";
   if (reason) out["reason"] = reason;
   send(out, wire::Type::CommandResult, request);
@@ -107,7 +161,9 @@ void setFault(bool enabled) {
   JsonDocument out;
   out["boot_id"] = kBootId;
   out["event_id"] = errorRevision;
-  out["source"] = "simulator";
+  out["source"] = "stm32";
+  out["subsystem"] = "xray";
+  out["simulated"] = true;
   out["code"] = 1;
   out["transition"] = fault ? "raised" : "cleared";
   out["time_ms"] = millis();
@@ -170,7 +226,13 @@ void setup() {
 
 void loop() {
   const uint32_t tick = millis();
-  if (moving) distanceMm += tick - lastTick;  // Model speed of 1000 mm/s.
+  if (moving) {
+    const uint32_t step = tick - lastTick < 10000000 - distanceMm
+                              ? tick - lastTick : 10000000 - distanceMm;
+    distanceMm += step;  // Model speed 1000 mm/s, limit 10000 m.
+    travelMm += step;
+    if (distanceMm == 10000000) moving = false;
+  }
   lastTick = tick;
   decoder.expire(tick, 250);
   for (unsigned n = 0; n < 512 && bridge.available(); ++n) {
@@ -182,8 +244,13 @@ void loop() {
   const uint32_t now = millis();
   if (now - lastTelemetry >= 200) {
     lastTelemetry = now;
-    sendTelemetry(now);
+    sendFastTelemetry(now);
   }
+  if (now - lastSlowTelemetry >= 1000) {
+    lastSlowTelemetry = now;
+    sendSlowTelemetry(now);
+  }
+  sendSchemaPage(now);
   if (now - lastErrors >= 1000) {
     lastErrors = now;
     sendErrors();

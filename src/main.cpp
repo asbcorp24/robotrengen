@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <BridgePayload.h>
 #include <BridgeProtocol.h>
+#include <TelemetryCatalog.h>
 #include <esp_system.h>
 
 #include "BleTransport.h"
@@ -22,6 +23,12 @@ wire::Queue<Pending, 1> stops;
 wire::Queue<Pending, 8> commands;
 wire::Queue<Pending, 8> responses;
 wire::Queue<Pending, 4> telemetry;
+Pending localTelemetry, localSchema;
+bool localTelemetryReady = false, localSchemaReady = false, localSchemaRequested = false;
+size_t localSchemaPage = 0;
+uint32_t lastLocalSchemaMs = 0, lastLocalTelemetryMs = 0, localSequence = 0;
+uint32_t lastControllerRxMs = 0;
+bool controllerSeen = false;
 
 struct Counters {
   uint32_t uartRx = 0, uartBad = 0, uartTx = 0;
@@ -58,6 +65,7 @@ void invalidateSession() {
   commands.clear();
   responses.clear();
   telemetry.clear();
+  localTelemetryReady = localSchemaReady = localSchemaRequested = false;
   reassembler.reset();
   bleTx.size = 0;
   if (uartTx.size && uartTx.fromPhone) {
@@ -99,6 +107,13 @@ void readPhone(uint32_t now) {
       pending.generation = fragment.generation;
       pending.receivedMs = assemblyStartedMs;
       ++stats.bleRx;
+      if (pending.packet.type == wire::Type::SchemaRequest) {
+        localSchemaRequested = true;
+        localSchemaPage = 0;
+        lastLocalSchemaMs = millis() - 700;
+      }
+      if (pending.packet.type == wire::Type::SnapshotRequest)
+        lastLocalTelemetryMs = millis() - 1000;
       if (pending.packet.type == wire::Type::Stop) {
         // A newer stop supersedes a queued stop. Never retain older queued starts.
         stops.clear();
@@ -124,6 +139,8 @@ void readController(uint32_t now) {
         continue;
       }
       ++stats.uartRx;
+      lastControllerRxMs = now;
+      controllerSeen = true;
       if (!ble.ready()) continue;  // Reconnect must request a fresh snapshot.
       JsonDocument json;
       if (!payload::readCbor(packet, json) || !payload::writeJson(json.as<JsonVariantConst>(), packet)) {
@@ -214,6 +231,68 @@ void writeController(uint32_t now) {
   }
 }
 
+bool makeLocalPacket(JsonDocument& doc, wire::Type type, uint32_t now, Pending& pending) {
+  if (doc.overflowed() || !payload::writeJson(doc.as<JsonVariantConst>(), pending.packet)) return false;
+  pending.packet.type = type;
+  pending.packet.sequence = ++localSequence;
+  pending.generation = ble.generation();
+  pending.receivedMs = now;
+  return true;
+}
+
+const char* phyName(uint8_t phy) {
+  switch (phy) {
+    case 1: return "1M";
+    case 2: return "2M";
+    case 3: return "Coded";
+    default: return "unknown";
+  }
+}
+
+void prepareLocalTelemetry(uint32_t now) {
+  if (!ble.ready()) return;
+  if (localSchemaRequested && !localSchemaReady && now - lastLocalSchemaMs >= 700) {
+    JsonDocument doc;
+    catalog::schemaPage(doc, "esp32", catalog::kEsp32Fields, localSchemaPage);
+    if (makeLocalPacket(doc, wire::Type::Schema, now, localSchema)) {
+      localSchemaReady = true;
+      lastLocalSchemaMs = now;
+      if (++localSchemaPage == catalog::pageCount(catalog::kEsp32Fields)) localSchemaRequested = false;
+    }
+  }
+  if (now - lastLocalTelemetryMs < 1000) return;
+  lastLocalTelemetryMs = now;
+  JsonDocument doc;
+  doc["source"] = "esp32";
+  doc["simulated"] = false;
+  doc["boot_id"] = bootId;
+  doc["sample_ms"] = now;
+  doc["group"] = "bridge";
+  JsonObject values = doc["values"].to<JsonObject>();
+  values["uptime_ms"] = now;
+  values["heap_free_bytes"] = ESP.getFreeHeap();
+  values["heap_min_bytes"] = ESP.getMinFreeHeap();
+  int8_t rssi;
+  if (ble.readRssi(rssi)) values["ble_rssi_dbm"] = rssi;
+  else values["ble_rssi_dbm"] = nullptr;
+  values["ble_mtu"] = ble.valueCapacity() + 3;
+  values["ble_tx_phy"] = phyName(ble.txPhy());
+  values["ble_rx_phy"] = phyName(ble.rxPhy());
+  values["stm32_link_ok"] = controllerSeen && now - lastControllerRxMs <= 2000;
+  if (controllerSeen) values["stm32_last_rx_age_ms"] = now - lastControllerRxMs;
+  else values["stm32_last_rx_age_ms"] = nullptr;
+  values["uart_rx_packets"] = stats.uartRx;
+  values["uart_bad_packets"] = stats.uartBad;
+  values["uart_tx_packets"] = stats.uartTx;
+  values["ble_rx_packets"] = stats.bleRx;
+  values["ble_tx_packets"] = stats.bleTx;
+  values["queue_drops"] = stats.queueDrops;
+  values["ingress_drops"] = ble.rxDrops();
+  values["expired_packets"] = stats.expired;
+  values["notify_failures"] = stats.notifyFailures;
+  localTelemetryReady = makeLocalPacket(doc, wire::Type::Telemetry, now, localTelemetry);
+}
+
 void writePhone(uint32_t now) {
   if (!ble.ready()) return;
   // A response may replace an unfinished telemetry message (new offset 0).
@@ -227,6 +306,17 @@ void writePhone(uint32_t now) {
     Pending pending;
     bool found = responses.pop(pending);
     bleTx.isTelemetry = !found;
+    if (!found && localSchemaReady) {
+      pending = localSchema;
+      localSchemaReady = false;
+      bleTx.isTelemetry = false;
+      found = true;
+    }
+    if (!found && localTelemetryReady) {
+      pending = localTelemetry;
+      localTelemetryReady = false;
+      found = true;
+    }
     if (!found) found = telemetry.pop(pending);
     if (!found) return;
     if (!ble.current(pending.generation) ||
@@ -288,11 +378,13 @@ void loop() {
     lastGeneration = generation;
     wasReady = ready;
     linkDirty = true;
+    if (ready) lastLocalTelemetryMs = now - 1000;
     Serial.printf("BLE generation=%lu ready=%d\n", static_cast<unsigned long>(generation), ready);
   }
   readPhone(now);
   writeController(millis());
   readController(millis());
+  prepareLocalTelemetry(millis());
   writePhone(millis());
   if (static_cast<uint32_t>(now - lastStatsMs) >= config::kStatsIntervalMs) {
     lastStatsMs = now;
